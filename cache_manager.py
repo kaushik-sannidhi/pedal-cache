@@ -32,8 +32,6 @@ from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass, asdict
 import time
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import sys
 
 # Try to import lz4 for compression (significant speedup for large files)
 try:
@@ -128,42 +126,42 @@ class CacheManager:
     def _pickle_save(self, obj: Any, filepath: Path) -> int:
         """
         Save object to pickle file with optional compression.
-
+        Memory-optimized: uses streaming to avoid holding entire serialized object in memory.
+        
         Returns:
             File size in bytes
         """
-        # Serialize to bytes first
-        pickled_data = pickle.dumps(obj, protocol=self.PICKLE_PROTOCOL)
-
         if self.use_compression:
-            # Compress with lz4 (very fast compression/decompression)
-            compressed_data = lz4.frame.compress(pickled_data, compression_level=0)  # Level 0 = fast
-            with open(filepath, 'wb') as f:
-                f.write(compressed_data)
-            return len(compressed_data)
+            # Stream directly to compressed file to minimize memory usage
+            with lz4.frame.open(filepath, mode='wb', compression_level=0) as f:
+                pickle.dump(obj, f, protocol=self.PICKLE_PROTOCOL)
+            return filepath.stat().st_size
         else:
+            # Direct pickle to file (no intermediate buffer)
             with open(filepath, 'wb') as f:
-                f.write(pickled_data)
-            return len(pickled_data)
+                pickle.dump(obj, f, protocol=self.PICKLE_PROTOCOL)
+            return filepath.stat().st_size
 
     def _pickle_load(self, filepath: Path) -> Any:
         """
         Load object from pickle file with optional decompression.
+        Memory-optimized: streams decompression to avoid large intermediate buffers.
         """
-        with open(filepath, 'rb') as f:
-            file_data = f.read()
-
         if self.use_compression:
-            # Decompress with lz4
             try:
-                decompressed_data = lz4.frame.decompress(file_data)
-                return pickle.loads(decompressed_data)
-            except lz4.frame.LZ4FrameError:
+                # Stream decompression directly from file
+                with lz4.frame.open(filepath, mode='rb') as f:
+                    obj = pickle.load(f)
+                return obj
+            except (lz4.frame.LZ4FrameError, pickle.UnpicklingError):
                 # Fall back to uncompressed if decompression fails (backward compatibility)
                 logger.warning(f"Failed to decompress {filepath.name}, trying uncompressed load")
-                return pickle.loads(file_data)
+                with open(filepath, 'rb') as f:
+                    return pickle.load(f)
         else:
-            return pickle.loads(file_data)
+            # Direct load from file
+            with open(filepath, 'rb') as f:
+                return pickle.load(f)
 
     def _calculate_file_hash(self, filepath: Path) -> str:
         """
@@ -307,7 +305,8 @@ class CacheManager:
                    route_calculator: Any,
                    source_files: Dict[Path, str]):
         """
-        Save all processed data to cache with compression.
+        Save all processed data to cache with compression and memory optimization.
+        Uses streaming serialization and aggressive garbage collection to minimize peak memory.
 
         Args:
             crime_analyzer: CrimeDataAnalyzer instance
@@ -328,30 +327,38 @@ class CacheManager:
             # Save each component using optimized pickle save
             logger.info("Saving components (with compression)..." if self.use_compression else "Saving components...")
 
-            # Crime analyzer
+            # Crime analyzer (small)
             t0 = time.time()
             size = self._pickle_save(crime_analyzer, self.crime_analyzer_cache)
             logger.info(f"  ✓ Crime analyzer ({size / 1024 / 1024:.1f} MB in {time.time()-t0:.2f}s)")
+            import gc
+            gc.collect()  # Clean up serialization buffers
 
-            # OSM analyzer (usually largest component)
-            t0 = time.time()
-            size = self._pickle_save(osm_analyzer, self.osm_analyzer_cache)
-            logger.info(f"  ✓ OSM analyzer ({size / 1024 / 1024:.1f} MB in {time.time()-t0:.2f}s)")
-
-            # Calibrated weights (smallest)
+            # Calibrated weights (tiny - save early)
             t0 = time.time()
             size = self._pickle_save(calibrated_weights, self.calibrated_weights_cache)
             logger.info(f"  ✓ Calibrated weights ({size / 1024 / 1024:.1f} MB in {time.time()-t0:.2f}s)")
+            gc.collect()
+
+            # OSM analyzer (LARGEST - most memory intensive)
+            t0 = time.time()
+            logger.info("  → Saving OSM analyzer (large, may take time)...")
+            size = self._pickle_save(osm_analyzer, self.osm_analyzer_cache)
+            logger.info(f"  ✓ OSM analyzer ({size / 1024 / 1024:.1f} MB in {time.time()-t0:.2f}s)")
+            gc.collect()  # Critical cleanup after large object
 
             # Graph builder (large - contains multiple weighted graphs)
             t0 = time.time()
+            logger.info("  → Saving graph builder (large, may take time)...")
             size = self._pickle_save(graph_builder, self.graph_builder_cache)
             logger.info(f"  ✓ Graph builder ({size / 1024 / 1024:.1f} MB in {time.time()-t0:.2f}s)")
+            gc.collect()  # Critical cleanup after large object
 
-            # Route calculator
+            # Route calculator (medium)
             t0 = time.time()
             size = self._pickle_save(route_calculator, self.route_calculator_cache)
             logger.info(f"  ✓ Route calculator ({size / 1024 / 1024:.1f} MB in {time.time()-t0:.2f}s)")
+            gc.collect()
 
             # Save metadata last (indicates successful cache save)
             self._save_metadata(source_file_hashes)
@@ -367,6 +374,10 @@ class CacheManager:
             elapsed = time.time() - start_time
             throughput = total_size / elapsed if elapsed > 0 else 0
             logger.info(f"✓ Cache saved: {total_size:.1f} MB in {elapsed:.2f}s ({throughput:.1f} MB/s)")
+            
+            # Final cleanup
+            gc.collect()
+            logger.info(f"✓ Memory cleanup after cache save: {gc.collect()} objects collected")
 
             return True
 
@@ -380,65 +391,88 @@ class CacheManager:
 
     def load_cache(self) -> Optional[Tuple[Any, Any, Any, Any, Any]]:
         """
-        Load all processed data from cache with parallel loading.
+        Load all processed data from cache with memory optimization.
+        Loads sequentially (not parallel) to minimize peak memory usage.
 
         Returns:
             Tuple of (crime_analyzer, osm_analyzer, calibrated_weights, graph_builder, route_calculator)
             or None if cache cannot be loaded
         """
         try:
-            logger.info("Loading data from cache...")
+            import gc
+            logger.info("Loading data from cache (memory-optimized)...")
             start_time = time.time()
 
-            # Define loading tasks (independent components can be loaded in parallel)
             components = {}
-            load_times = {}
+            total_size = 0
+            
+            # Load components SEQUENTIALLY to minimize peak memory
+            # (Parallel loading causes all objects in memory at once)
+            
+            # 1. Crime analyzer (small)
+            t0 = time.time()
+            components['crime_analyzer'] = self._pickle_load(self.crime_analyzer_cache)
+            size_mb = self.crime_analyzer_cache.stat().st_size / 1024 / 1024
+            total_size += size_mb
+            logger.info(f"  ✓ Crime analyzer ({size_mb:.1f} MB in {time.time()-t0:.2f}s)")
+            gc.collect()
 
-            def load_component(name: str, filepath: Path):
-                """Helper to load a component and track timing"""
-                t0 = time.time()
-                obj = self._pickle_load(filepath)
-                elapsed = time.time() - t0
-                size_mb = filepath.stat().st_size / 1024 / 1024
-                return name, obj, elapsed, size_mb
+            # 2. Calibrated weights (tiny)
+            t0 = time.time()
+            components['calibrated_weights'] = self._pickle_load(self.calibrated_weights_cache)
+            size_mb = self.calibrated_weights_cache.stat().st_size / 1024 / 1024
+            total_size += size_mb
+            logger.info(f"  ✓ Calibrated weights ({size_mb:.1f} MB in {time.time()-t0:.2f}s)")
+            gc.collect()
 
-            # Load components in parallel for maximum speed
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {
-                    executor.submit(load_component, 'crime_analyzer', self.crime_analyzer_cache): 'crime_analyzer',
-                    executor.submit(load_component, 'osm_analyzer', self.osm_analyzer_cache): 'osm_analyzer',
-                    executor.submit(load_component, 'calibrated_weights', self.calibrated_weights_cache): 'calibrated_weights',
-                    executor.submit(load_component, 'graph_builder', self.graph_builder_cache): 'graph_builder',
-                    executor.submit(load_component, 'route_calculator', self.route_calculator_cache): 'route_calculator',
-                }
+            # 3. OSM analyzer (LARGEST - load carefully)
+            t0 = time.time()
+            logger.info("  → Loading OSM analyzer (large, may take time)...")
+            components['osm_analyzer'] = self._pickle_load(self.osm_analyzer_cache)
+            size_mb = self.osm_analyzer_cache.stat().st_size / 1024 / 1024
+            total_size += size_mb
+            logger.info(f"  ✓ OSM analyzer ({size_mb:.1f} MB in {time.time()-t0:.2f}s)")
+            collected = gc.collect()
+            if collected > 0:
+                logger.info(f"    → Memory cleanup: {collected} objects collected")
 
-                for future in as_completed(futures):
-                    name, obj, elapsed, size_mb = future.result()
-                    components[name] = obj
-                    load_times[name] = elapsed
-                    logger.info(f"  ✓ {name.replace('_', ' ').title()} ({size_mb:.1f} MB in {elapsed:.2f}s)")
+            # 4. Graph builder (large)
+            t0 = time.time()
+            logger.info("  → Loading graph builder (large, may take time)...")
+            components['graph_builder'] = self._pickle_load(self.graph_builder_cache)
+            size_mb = self.graph_builder_cache.stat().st_size / 1024 / 1024
+            total_size += size_mb
+            logger.info(f"  ✓ Graph builder ({size_mb:.1f} MB in {time.time()-t0:.2f}s)")
+            collected = gc.collect()
+            if collected > 0:
+                logger.info(f"    → Memory cleanup: {collected} objects collected")
+
+            # 5. Route calculator (medium)
+            t0 = time.time()
+            components['route_calculator'] = self._pickle_load(self.route_calculator_cache)
+            size_mb = self.route_calculator_cache.stat().st_size / 1024 / 1024
+            total_size += size_mb
+            logger.info(f"  ✓ Route calculator ({size_mb:.1f} MB in {time.time()-t0:.2f}s)")
+            gc.collect()
 
             # Verify all components loaded
-            required_components = ['crime_analyzer', 'osm_analyzer', 'calibrated_weights',
+            required_components = ['crime_analyzer', 'osm_analyzer', 'calibrated_weights', 
                                   'graph_builder', 'route_calculator']
             if not all(comp in components for comp in required_components):
                 logger.error("Failed to load all required components")
                 return None
 
             total_elapsed = time.time() - start_time
-            total_size = sum(f.stat().st_size for f in [
-                self.crime_analyzer_cache,
-                self.osm_analyzer_cache,
-                self.calibrated_weights_cache,
-                self.graph_builder_cache,
-                self.route_calculator_cache
-            ]) / 1024 / 1024
-
             throughput = total_size / total_elapsed if total_elapsed > 0 else 0
             logger.info(f"✓ Cache loaded: {total_size:.1f} MB in {total_elapsed:.2f}s ({throughput:.1f} MB/s)")
-            logger.info(f"  Speedup from parallel loading: ~{sum(load_times.values()) / total_elapsed:.1f}x")
+            logger.info(f"  Sequential loading minimized peak memory usage")
+            
+            # Final cleanup
+            collected = gc.collect()
+            if collected > 0:
+                logger.info(f"✓ Final memory cleanup: {collected} objects collected")
 
-            return (components['crime_analyzer'],
+            return (components['crime_analyzer'], 
                    components['osm_analyzer'],
                    components['calibrated_weights'],
                    components['graph_builder'],
